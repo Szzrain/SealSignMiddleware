@@ -32,6 +32,20 @@ func init() {
 	}
 }
 
+func TestInit(t *testing.T) {
+	if len(testPubKey) != ed25519.PublicKeySize {
+		t.Fatalf("invalid test public key size: got %d, want %d", len(testPubKey), ed25519.PublicKeySize)
+	}
+	if len(testPrivKey) != ed25519.PrivateKeySize {
+		t.Fatalf("invalid test private key size: got %d, want %d", len(testPrivKey), ed25519.PrivateKeySize)
+	}
+	if len(testSecret) < 32 {
+		t.Fatalf("test secret too short: got %d bytes, want at least 32", len(testSecret))
+	}
+	t.Logf("test public key: %x", testPubKey)
+	t.Logf("test private key: %x", testPrivKey)
+}
+
 func newMiddleware() *AuthMiddleware {
 	return New(Config{PublicKey: testPubKey, JWTSecret: testSecret})
 }
