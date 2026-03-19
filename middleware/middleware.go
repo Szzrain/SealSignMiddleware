@@ -53,7 +53,13 @@ const (
 	PayloadSize = UINSize + TimestampSize + SignatureSize // 80
 
 	// TokenExpiry is the lifetime of an issued access token.
-	TokenExpiry = 2 * time.Hour
+	TokenExpiry = 72 * time.Hour
+	// TokenRenewThreshold is the remaining-lifetime window within which a
+	// still-valid Bearer token will be proactively renewed.  When the token
+	// expires in less than this duration the middleware issues a fresh token
+	// in the X-Set-Token response header so the client can replace it without
+	// interruption.
+	TokenRenewThreshold = 8 * time.Hour
 	// TimestampTolerance is the maximum clock-skew / replay window (300 s).
 	TimestampTolerance = 300 * time.Second
 )
@@ -171,6 +177,14 @@ func (m *AuthMiddleware) handleBearerToken(
 	if claims.UIN != bodyUIN {
 		http.Error(w, "uin mismatch", http.StatusUnauthorized)
 		return
+	}
+
+	// Proactively renew the token when it will expire within TokenRenewThreshold
+	// so the client always has a long-lived token without needing a re-auth.
+	if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
+		if newToken, err := m.generateToken(claims.UIN); err == nil {
+			w.Header().Set("X-Set-Token", newToken)
+		}
 	}
 
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))

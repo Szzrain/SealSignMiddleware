@@ -50,7 +50,7 @@ import (
 
 var (
 	flagServer  = flag.String("server", "http://localhost:8080", "proxy server base URL")
-	flagPath    = flag.String("path", "/get", "request path")
+	flagPath    = flag.String("path", "/api/sign/sec-sign", "request path")
 	flagUIN     = flag.Uint64("uin", 12345678, "user identifier (uin)")
 	flagPrivKey = flag.String("privkey", "keys/private.hex", "path to 64-byte Ed25519 private key hex file")
 )
@@ -141,9 +141,25 @@ func buildSignatureHeader(privKey ed25519.PrivateKey, uin uint64) string {
 	return middleware.Base2048Encode(payload[:])
 }
 
+type bodyCompat struct {
+	UIN     uint64 `json:"uin"`
+	Command string `json:"command"`
+	Seq     uint64 `json:"seq"`
+	Body    string `json:"body"`
+	Guid    string `json:"guid"`
+	Qua     string `json:"qua"`
+}
+
 // buildBody returns a minimal JSON body containing the uin field.
 func buildBody(uin uint64) []byte {
-	b, _ := json.Marshal(map[string]uint64{"uin": uin})
+	b, _ := json.Marshal(bodyCompat{
+		UIN:     uin,
+		Command: "wtlogin.login",
+		Seq:     1,
+		Body:    "1122334411223344",
+		Guid:    "e8581c1595667d1008c8fa47b6199127",
+		Qua:     "V1_LNX_NQ_3.2.26_46494_GW_B",
+	})
 	return b
 }
 
