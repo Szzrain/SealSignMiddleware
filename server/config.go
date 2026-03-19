@@ -108,5 +108,5 @@ func loadPublicKeyHex(path string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("config: public key must be %d bytes, got %d",
 			ed25519.PublicKeySize, len(decoded))
 	}
-	return ed25519.PublicKey(decoded), nil
+	return decoded, nil
 }
