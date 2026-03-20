@@ -213,7 +213,7 @@ func loadOrGeneratePrivKey(hexFile string) ed25519.PrivateKey {
 			log.Fatalf("private key must be %d bytes, got %d", ed25519.PrivateKeySize, len(decoded))
 		}
 		log.Printf("loaded private key from %s", hexFile)
-		return ed25519.PrivateKey(decoded)
+		return decoded
 	}
 
 	// File not found – generate a fresh pair.

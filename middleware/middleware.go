@@ -287,6 +287,45 @@ func (m *AuthMiddleware) generateToken(uin uint64) (string, error) {
 	return token.SignedString(m.jwtSecret)
 }
 
+// RefreshHandler returns an http.Handler that only renews the JWT token.
+// It validates the Bearer token in the Authorization header and, if the token
+// will expire within TokenRenewThreshold, issues a fresh token in the
+// X-Set-Token response header.  If the token is still fresh (more than
+// TokenRenewThreshold remaining) it responds 200 with no X-Set-Token header.
+// No request body is required and the request is NOT forwarded downstream.
+func (m *AuthMiddleware) RefreshHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, "invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+		tokenStr := auth[len(prefix):]
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, jwt.ErrSignatureInvalid
+			}
+			return m.jwtSecret, nil
+		})
+		if err != nil || !token.Valid {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		// Only set X-Set-Token when the token is approaching expiry.
+		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
+			if newToken, err := m.generateToken(claims.UIN); err == nil {
+				w.Header().Set("X-Set-Token", newToken)
+			}
+		}
+
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
 // Stop shuts down background goroutines started by the middleware (e.g. the
 // replay-cache GC).  Call it when the server is shutting down to avoid goroutine
 // leaks.  After Stop returns the middleware must not be used.

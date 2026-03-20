@@ -48,6 +48,8 @@ func main() {
 	defer auth.Stop()
 
 	mux := http.NewServeMux()
+	// /token/refresh – validate JWT and conditionally renew; never proxied downstream.
+	mux.Handle("/token/refresh", auth.RefreshHandler())
 	mux.Handle("/", auth.Handler(proxyHandler))
 
 	// -------------------------------------------------------------------------
