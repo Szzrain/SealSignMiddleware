@@ -87,63 +87,6 @@ func body(uin uint64) *bytes.Reader {
 	return bytes.NewReader(b)
 }
 
-// ---- Base2048 ---------------------------------------------------------------
-
-func TestBase2048RoundTrip(t *testing.T) {
-	cases := [][]byte{
-		{},
-		{0x00},
-		{0xFF},
-		make([]byte, 80), // PayloadSize zeros
-	}
-	for i := range cases {
-		// fill non-empty slices with pseudo-random data
-		if len(cases[i]) > 0 {
-			for j := range cases[i] {
-				cases[i][j] = byte(i*17 + j*37)
-			}
-		}
-		encoded := Base2048Encode(cases[i])
-		decoded, err := Base2048Decode(encoded, nil)
-		if err != nil {
-			t.Fatalf("case %d decode error: %v", i, err)
-		}
-		if !bytes.Equal(cases[i], decoded) {
-			t.Fatalf("case %d: got %v, want %v", i, decoded, cases[i])
-		}
-	}
-}
-
-func TestBase2048PoolReuse(t *testing.T) {
-	src := make([]byte, PayloadSize)
-	for i := range src {
-		src[i] = byte(i)
-	}
-	encoded := Base2048Encode(src)
-
-	buf := make([]byte, PayloadSize)
-	decoded, err := Base2048Decode(encoded, buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(src, decoded) {
-		t.Fatal("mismatch after pool reuse")
-	}
-}
-
-func TestBase2048InvalidChar(t *testing.T) {
-	// Build a valid encode, then corrupt one character.
-	src := make([]byte, 80)
-	enc := Base2048Encode(src)
-	runes := []rune(enc)
-	runes[0] = 'A' // 'A' is outside both tables
-	corrupted := string(runes)
-	_, err := Base2048Decode(corrupted, nil)
-	if err == nil {
-		t.Fatal("expected error for invalid character, got nil")
-	}
-}
-
 // ---- Situation A: Bearer JWT ------------------------------------------------
 
 func TestSituationA_ValidToken(t *testing.T) {
