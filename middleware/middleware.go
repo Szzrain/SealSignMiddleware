@@ -13,17 +13,16 @@
 //
 // Situation B – X-Launcher-Signature
 //
-//	X-Launcher-Signature: <base2048-encoded payload>
+//	X-Launcher-Signature: <base64-encoded payload>
 //
 // The payload decodes to: uin(8B) | timestamp(8B) | signature(64B).
 // The middleware checks the timestamp (±300 s), verifies the Ed25519 signature
-// over uin+timestamp, checks the body uin, generates a 2-hour JWT and returns
+// over uin+timestamp, checks the body uin, generates a JWT and returns
 // it in the X-Set-Token response header, then forwards the request.
 //
 // Performance notes:
 //   - The Ed25519 public key is pre-loaded once in Config; it is never
 //     re-parsed inside the middleware hot-path.
-//   - A sync.Pool recycles the 80-byte decode buffer used for Situation B.
 //   - A TTL cache records recently seen signatures to reject replays cheaply
 //     (without re-running Ed25519 verify).
 package middleware
@@ -31,12 +30,13 @@ package middleware
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -88,10 +88,6 @@ type AuthMiddleware struct {
 	pubKey    ed25519.PublicKey
 	jwtSecret []byte
 
-	// bufPool recycles the fixed-size decode buffer used in Situation B to
-	// avoid per-request heap allocations in the hot path.
-	bufPool sync.Pool
-
 	// cache records recently verified signatures to detect replays without
 	// re-running the expensive Ed25519 verify operation.
 	cache *sigCache
@@ -104,12 +100,6 @@ func New(cfg Config) *AuthMiddleware {
 		pubKey:    cfg.PublicKey,
 		jwtSecret: cfg.JWTSecret,
 		cache:     newSigCache(),
-	}
-	m.bufPool = sync.Pool{
-		New: func() any {
-			b := make([]byte, PayloadSize)
-			return &b
-		},
 	}
 	return m
 }
@@ -138,6 +128,7 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
+		fmt.Printf("[middleware] unauthorized: no auth header remote=%s path=%s\n", r.RemoteAddr, r.URL.Path)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	})
 }
@@ -152,6 +143,7 @@ func (m *AuthMiddleware) handleBearerToken(
 ) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(authHeader, prefix) {
+		fmt.Printf("[bearer] malformed authorization header remote=%s path=%s\n", r.RemoteAddr, r.URL.Path)
 		http.Error(w, "invalid authorization header", http.StatusUnauthorized)
 		return
 	}
@@ -165,16 +157,20 @@ func (m *AuthMiddleware) handleBearerToken(
 		return m.jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
+		fmt.Printf("[bearer] invalid token remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	bodyUIN, err := extractUIN(bodyBytes)
+	bodyUIN, bodyCmd, err := extractUIN(bodyBytes)
 	if err != nil {
+		fmt.Printf("[bearer] failed to extract UIN from body remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid request body", http.StatusUnauthorized)
 		return
 	}
-	if claims.UIN != bodyUIN {
+
+	if claims.UIN != bodyUIN && bodyCmd != "wtlogin.trans_emp" && bodyUIN != 0 {
+		fmt.Printf("[bearer] UIN mismatch remote=%s path=%s token_uin=%d body_uin=%d cmd:%s\n", r.RemoteAddr, r.URL.Path, claims.UIN, bodyUIN, bodyCmd)
 		http.Error(w, "uin mismatch", http.StatusUnauthorized)
 		return
 	}
@@ -184,9 +180,13 @@ func (m *AuthMiddleware) handleBearerToken(
 	if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
 		if newToken, err := m.generateToken(claims.UIN); err == nil {
 			w.Header().Set("X-Set-Token", newToken)
+			fmt.Printf("[bearer] token renewed proactively uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
+		} else {
+			fmt.Printf("[bearer] failed to generate renewal token uin=%d err=%v\n", claims.UIN, err)
 		}
 	}
 
+	fmt.Printf("[bearer] auth OK uin=%d remote=%s path=%s\n", claims.UIN, r.RemoteAddr, r.URL.Path)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -199,21 +199,16 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	sigHeader string,
 	bodyBytes []byte,
 ) {
-	// --- 1. Decode Base2048 payload, reusing pooled buffer ---
-	bufPtr := m.bufPool.Get().(*[]byte)
-	decoded, err := Base2048Decode(sigHeader, *bufPtr)
+	// --- 1. Decode base64 payload ---
+	decoded, err := base64.StdEncoding.DecodeString(sigHeader)
 	if err != nil || len(decoded) < PayloadSize {
-		m.bufPool.Put(bufPtr)
+		fmt.Printf("[launcher-sig] failed to decode header remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid signature header", http.StatusUnauthorized)
 		return
 	}
-	// Keep a fixed-size copy so we can return the buffer before the expensive
-	// Ed25519 verification step.
+	// Keep a fixed-size copy.
 	var payload [PayloadSize]byte
 	copy(payload[:], decoded[:PayloadSize])
-	// Update the backing slice pointer in case Base2048Decode reallocated.
-	*bufPtr = decoded
-	m.bufPool.Put(bufPtr)
 
 	// --- 2. Parse fields ---
 	uin := binary.BigEndian.Uint64(payload[0:8])
@@ -227,6 +222,7 @@ func (m *AuthMiddleware) handleLauncherSignature(
 		diff = -diff
 	}
 	if diff > int64(TimestampTolerance.Seconds()) {
+		fmt.Printf("[launcher-sig] timestamp expired remote=%s path=%s uin=%d diff_sec=%d\n", r.RemoteAddr, r.URL.Path, uin, diff)
 		http.Error(w, "timestamp expired", http.StatusUnauthorized)
 		return
 	}
@@ -236,6 +232,7 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	// the request is a replay: reject it cheaply without re-running Ed25519.
 	cacheKey := string(signature[:])
 	if m.cache.has(cacheKey) {
+		fmt.Printf("[launcher-sig] replayed signature remote=%s path=%s uin=%d\n", r.RemoteAddr, r.URL.Path, uin)
 		http.Error(w, "replayed signature", http.StatusUnauthorized)
 		return
 	}
@@ -244,17 +241,21 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	// The signed message is uin(8B) || timestamp(8B).
 	message := payload[0:16]
 	if !ed25519.Verify(m.pubKey, message, signature[:]) {
+		fmt.Printf("[launcher-sig] Ed25519 verification failed remote=%s path=%s uin=%d\n", r.RemoteAddr, r.URL.Path, uin)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
 
 	// --- 6. Body UIN check ---
-	bodyUIN, err := extractUIN(bodyBytes)
+	bodyUIN, bodyCmd, err := extractUIN(bodyBytes)
 	if err != nil {
+		fmt.Printf("[launcher-sig] failed to extract UIN from body remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid request body", http.StatusUnauthorized)
 		return
 	}
-	if uin != bodyUIN {
+
+	if uin != bodyUIN && bodyCmd != "wtlogin.trans_emp" && bodyUIN != 0 {
+		fmt.Printf("[launcher-sig] UIN mismatch remote=%s path=%s sig_uin=%d body_uin=%d cmd=%s\n", r.RemoteAddr, r.URL.Path, uin, bodyUIN, bodyCmd)
 		http.Error(w, "uin mismatch", http.StatusUnauthorized)
 		return
 	}
@@ -264,11 +265,13 @@ func (m *AuthMiddleware) handleLauncherSignature(
 
 	tokenStr, err := m.generateToken(uin)
 	if err != nil {
+		fmt.Printf("[launcher-sig] failed to generate token uin=%d err=%v\n", uin, err)
 		http.Error(w, "failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("X-Set-Token", tokenStr)
 
+	fmt.Printf("[launcher-sig] auth OK, token issued uin=%d remote=%s path=%s\n", uin, r.RemoteAddr, r.URL.Path)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -298,6 +301,7 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if !strings.HasPrefix(auth, prefix) {
+			fmt.Printf("[refresh] malformed authorization header remote=%s\n", r.RemoteAddr)
 			http.Error(w, "invalid authorization header", http.StatusUnauthorized)
 			return
 		}
@@ -311,6 +315,7 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 			return m.jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
+			fmt.Printf("[refresh] invalid token remote=%s err=%v\n", r.RemoteAddr, err)
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
@@ -319,7 +324,12 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
 			if newToken, err := m.generateToken(claims.UIN); err == nil {
 				w.Header().Set("X-Set-Token", newToken)
+				fmt.Printf("[refresh] token renewed uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
+			} else {
+				fmt.Printf("[refresh] failed to generate token uin=%d err=%v\n", claims.UIN, err)
 			}
+		} else {
+			fmt.Printf("[refresh] token still fresh, no renewal uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -334,12 +344,13 @@ func (m *AuthMiddleware) Stop() {
 }
 
 // The field is expected to be a non-negative integer.
-func extractUIN(body []byte) (uint64, error) {
+func extractUIN(body []byte) (uint64, string, error) {
 	var req struct {
 		UIN uint64 `json:"uin"`
+		Cmd string `json:"command"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return req.UIN, nil
+	return req.UIN, req.Cmd, nil
 }
