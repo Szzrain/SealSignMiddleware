@@ -3,7 +3,7 @@
 // It exercises the full two-leg authentication flow:
 //
 //	Leg 1 – X-Launcher-Signature
-//	  Builds uin(8B) | timestamp(8B) | ed25519-signature(64B), Base2048-encodes
+//	  Builds uin(8B) | timestamp(8B) | ed25519-signature(64B), base64-encodes
 //	  it, sends a POST to the target server, and reads the X-Set-Token header
 //	  from the response.
 //
@@ -29,6 +29,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -40,8 +41,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/Szzrain/SealSignMiddleware/middleware"
 )
 
 // ---------------------------------------------------------------------------
@@ -126,7 +125,7 @@ func main() {
 //
 //	payload = uin(8B big-endian) | timestamp(8B big-endian)
 //	sig     = Ed25519Sign(privKey, payload)
-//	header  = Base2048Encode(uin | timestamp | sig)
+//	header  = base64.StdEncoding(uin | timestamp | sig)
 func buildSignatureHeader(privKey ed25519.PrivateKey, uin uint64) string {
 	var msg [16]byte
 	binary.BigEndian.PutUint64(msg[0:8], uin)
@@ -138,7 +137,7 @@ func buildSignatureHeader(privKey ed25519.PrivateKey, uin uint64) string {
 	copy(payload[0:16], msg[:])
 	copy(payload[16:80], sig)
 
-	return middleware.Base2048Encode(payload[:])
+	return base64.StdEncoding.EncodeToString(payload[:])
 }
 
 type bodyCompat struct {

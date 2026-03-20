@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -62,7 +63,7 @@ func buildSignatureHeader(privKey ed25519.PrivateKey, uin uint64, ts int64) stri
 	binary.BigEndian.PutUint64(payload[8:16], uint64(ts))
 	sig := ed25519.Sign(privKey, payload[0:16])
 	copy(payload[16:], sig)
-	return Base2048Encode(payload)
+	return base64.StdEncoding.EncodeToString(payload)
 }
 
 // buildBearerToken mints a valid JWT for uin using secret.
@@ -377,7 +378,7 @@ func TestSituationB_BadSignature(t *testing.T) {
 	if _, err := rand.Read(payload[16:80]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	sigHeader := Base2048Encode(payload)
+	sigHeader := base64.StdEncoding.EncodeToString(payload)
 
 	req := httptest.NewRequest(http.MethodPost, "/", body(uin))
 	req.Header.Set("X-Launcher-Signature", sigHeader)
@@ -419,17 +420,17 @@ func TestSituationB_ReplayRejected(t *testing.T) {
 	}
 }
 
-func TestSituationB_InvalidBase2048(t *testing.T) {
+func TestSituationB_InvalidBase64(t *testing.T) {
 	m := newMiddleware()
 	h := m.Handler(okHandler)
 
 	req := httptest.NewRequest(http.MethodPost, "/", body(1))
-	req.Header.Set("X-Launcher-Signature", "!!!not-base2048!!!")
+	req.Header.Set("X-Launcher-Signature", "!!!not-base64!!!")
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for bad base2048, got %d", rr.Code)
+		t.Fatalf("expected 401 for bad base64, got %d", rr.Code)
 	}
 }
 
