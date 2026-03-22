@@ -1,0 +1,26 @@
+# Binaries / build artifacts
+*.exe
+*.out
+milky/
+scripts/
+
+# Editor / OS metadata
+.idea/
+.vscode/
+*.DS_Store
+
+# Git
+.git/
+.github/
+
+# Test artifacts
+*_test.go
+mockclient/
+mockluncher/
+
+# Sensitive material – mount these at runtime, never bake into the image
+config.yaml
+config.json
+keys/
+*.png
+

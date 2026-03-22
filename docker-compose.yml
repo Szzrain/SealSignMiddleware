@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  sealsign-middleware:
+    image: ghcr.io/szzrain/sealsignmiddleware:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sealsign-middleware
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your real config.yaml and keys/ directory here.
+      # The paths on the LEFT are host paths; the ones on the RIGHT are
+      # the paths the server reads inside the container.
+      - ./config.yaml:/app/config.yaml:ro
+      - ./keys:/app/keys:ro
+    environment:
+      - TZ=Asia/Shanghai
+
