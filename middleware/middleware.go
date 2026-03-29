@@ -30,6 +30,7 @@ package middleware
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -92,6 +93,11 @@ type AuthMiddleware struct {
 	// cache records recently verified signatures to detect replays without
 	// re-running the expensive Ed25519 verify operation.
 	cache *sigCache
+
+	// tracker counts distinct users active within the last 8 hours.
+	// Updates are fire-and-forget (non-blocking) so this field never adds
+	// latency to the auth hot-path.
+	tracker *activeTracker
 }
 
 // New creates a new AuthMiddleware from cfg.  The returned middleware is safe
@@ -101,6 +107,7 @@ func New(cfg Config) *AuthMiddleware {
 		pubKey:    cfg.PublicKey,
 		jwtSecret: cfg.JWTSecret,
 		cache:     newSigCache(),
+		tracker:   newActiveTracker(),
 	}
 	return m
 }
@@ -196,6 +203,7 @@ func (m *AuthMiddleware) handleBearerToken(
 	}
 
 	fmt.Printf("[%s][bearer] auth OK uin=%d remote=%s path=%s\n", logNow(), claims.UIN, r.RemoteAddr, r.URL.Path)
+	m.tracker.record(claims.UIN)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -297,6 +305,7 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	w.Header().Set("X-Set-Token", tokenStr)
 
 	fmt.Printf("[%s][launcher-sig] auth OK, token issued uin=%d remote=%s path=%s\n", logNow(), uin, r.RemoteAddr, r.URL.Path)
+	m.tracker.record(uin)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -357,15 +366,48 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 			fmt.Printf("[%s][refresh] token still fresh, no renewal uin=%d remaining=%s\n", logNow(), claims.UIN, time.Until(claims.ExpiresAt.Time))
 		}
 
+		m.tracker.record(claims.UIN)
 		w.WriteHeader(http.StatusOK)
 	})
 }
 
+// StatsHandler returns an http.Handler that reports the number of distinct
+// users active in the last 8 hours.
+//
+// Authentication: the caller must supply the raw jwt_secret value (from
+// config.yaml) as a Bearer token in the Authorization header.  Constant-time
+// comparison is used to prevent timing-based secret enumeration.
+func (m *AuthMiddleware) StatsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		token := auth[len(prefix):]
+		if subtle.ConstantTimeCompare([]byte(token), m.jwtSecret) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		snap := m.tracker.snapshot()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"active_users": snap.Count,
+			"window":       "8h",
+			"as_of":        snap.AsOf.Format("2006-01-02 15:04:05"),
+		})
+	})
+}
+
 // Stop shuts down background goroutines started by the middleware (e.g. the
-// replay-cache GC).  Call it when the server is shutting down to avoid goroutine
-// leaks.  After Stop returns the middleware must not be used.
+// replay-cache GC and the active-user tracker).  Call it when the server is
+// shutting down to avoid goroutine leaks.  After Stop returns the middleware
+// must not be used.
 func (m *AuthMiddleware) Stop() {
 	m.cache.stop()
+	m.tracker.stop()
 }
 
 // logNow returns the current local time as a formatted string for log lines.

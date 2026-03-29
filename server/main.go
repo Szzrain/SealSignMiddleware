@@ -50,6 +50,8 @@ func main() {
 	mux := http.NewServeMux()
 	// /token/refresh – validate JWT and conditionally renew; never proxied downstream.
 	mux.Handle("/token/refresh", auth.RefreshHandler())
+	// /stats/active-users – active user count (last 8 h); auth via raw jwt_secret as Bearer.
+	mux.Handle("/stats/active-users", auth.StatsHandler())
 	mux.Handle("/", auth.Handler(proxyHandler))
 
 	// -------------------------------------------------------------------------
