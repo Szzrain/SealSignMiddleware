@@ -33,6 +33,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -109,10 +110,18 @@ func New(cfg Config) *AuthMiddleware {
 // original bytes, and writes X-Set-Token on successful Situation B verification.
 func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Enforce a 1 MB body limit before reading to prevent memory exhaustion.
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 		// Read the body once so we can inspect it without consuming it.
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusUnauthorized)
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+			}
 			return
 		}
 		// Restore body immediately so the next call always sees a fresh reader.
@@ -128,7 +137,7 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		fmt.Printf("[middleware] unauthorized: no auth header remote=%s path=%s\n", r.RemoteAddr, r.URL.Path)
+		fmt.Printf("[%s][middleware] unauthorized: no auth header remote=%s path=%s\n", logNow(), r.RemoteAddr, r.URL.Path)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	})
 }
@@ -143,7 +152,7 @@ func (m *AuthMiddleware) handleBearerToken(
 ) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(authHeader, prefix) {
-		fmt.Printf("[bearer] malformed authorization header remote=%s path=%s\n", r.RemoteAddr, r.URL.Path)
+		fmt.Printf("[%s][bearer] malformed authorization header remote=%s path=%s\n", logNow(), r.RemoteAddr, r.URL.Path)
 		http.Error(w, "invalid authorization header", http.StatusUnauthorized)
 		return
 	}
@@ -157,20 +166,20 @@ func (m *AuthMiddleware) handleBearerToken(
 		return m.jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
-		fmt.Printf("[bearer] invalid token remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
+		fmt.Printf("[%s][bearer] invalid token remote=%s path=%s err=%v\n", logNow(), r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
 
 	bodyUIN, bodyCmd, err := extractUIN(bodyBytes)
 	if err != nil {
-		fmt.Printf("[bearer] failed to extract UIN from body remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
+		fmt.Printf("[%s][bearer] failed to extract UIN from body remote=%s path=%s err=%v\n", logNow(), r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid request body", http.StatusUnauthorized)
 		return
 	}
 
-	if claims.UIN != bodyUIN && bodyCmd != "wtlogin.trans_emp" && bodyUIN != 0 {
-		fmt.Printf("[bearer] UIN mismatch remote=%s path=%s token_uin=%d body_uin=%d cmd:%s\n", r.RemoteAddr, r.URL.Path, claims.UIN, bodyUIN, bodyCmd)
+	if bodyCmd != "wtlogin.trans_emp" && claims.UIN != bodyUIN {
+		fmt.Printf("[%s][bearer] UIN mismatch remote=%s path=%s token_uin=%d body_uin=%d cmd:%s\n", logNow(), r.RemoteAddr, r.URL.Path, claims.UIN, bodyUIN, bodyCmd)
 		http.Error(w, "uin mismatch", http.StatusUnauthorized)
 		return
 	}
@@ -180,13 +189,13 @@ func (m *AuthMiddleware) handleBearerToken(
 	if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
 		if newToken, err := m.generateToken(claims.UIN); err == nil {
 			w.Header().Set("X-Set-Token", newToken)
-			fmt.Printf("[bearer] token renewed proactively uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
+			fmt.Printf("[%s][bearer] token renewed proactively uin=%d remaining=%s\n", logNow(), claims.UIN, time.Until(claims.ExpiresAt.Time))
 		} else {
-			fmt.Printf("[bearer] failed to generate renewal token uin=%d err=%v\n", claims.UIN, err)
+			fmt.Printf("[%s][bearer] failed to generate renewal token uin=%d err=%v\n", logNow(), claims.UIN, err)
 		}
 	}
 
-	fmt.Printf("[bearer] auth OK uin=%d remote=%s path=%s\n", claims.UIN, r.RemoteAddr, r.URL.Path)
+	fmt.Printf("[%s][bearer] auth OK uin=%d remote=%s path=%s\n", logNow(), claims.UIN, r.RemoteAddr, r.URL.Path)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -200,9 +209,12 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	bodyBytes []byte,
 ) {
 	// --- 1. Decode base64 payload ---
+	if len(sigHeader) > 120 {
+		return
+	}
 	decoded, err := base64.StdEncoding.DecodeString(sigHeader)
 	if err != nil || len(decoded) < PayloadSize {
-		fmt.Printf("[launcher-sig] failed to decode header remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
+		fmt.Printf("[%s][launcher-sig] failed to decode header remote=%s path=%s err=%v\n", logNow(), r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid signature header", http.StatusUnauthorized)
 		return
 	}
@@ -222,17 +234,19 @@ func (m *AuthMiddleware) handleLauncherSignature(
 		diff = -diff
 	}
 	if diff > int64(TimestampTolerance.Seconds()) {
-		fmt.Printf("[launcher-sig] timestamp expired remote=%s path=%s uin=%d diff_sec=%d\n", r.RemoteAddr, r.URL.Path, uin, diff)
+		fmt.Printf("[%s][launcher-sig] timestamp expired remote=%s path=%s uin=%d diff_sec=%d\n", logNow(), r.RemoteAddr, r.URL.Path, uin, diff)
 		http.Error(w, "timestamp expired", http.StatusUnauthorized)
 		return
 	}
 
-	// --- 4. Replay / cache check ---
-	// The cache key is the raw 64-byte signature.  If it is already present
-	// the request is a replay: reject it cheaply without re-running Ed25519.
+	// --- 4. Replay / cache fast-path ---
+	// If the signature is already in the cache it is definitely a replay; reject
+	// cheaply without running Ed25519.  A second atomic check-and-add is
+	// performed after full verification (step 7) to close the TOCTOU window for
+	// concurrent first-use requests.
 	cacheKey := string(signature[:])
 	if m.cache.has(cacheKey) {
-		fmt.Printf("[launcher-sig] replayed signature remote=%s path=%s uin=%d\n", r.RemoteAddr, r.URL.Path, uin)
+		fmt.Printf("[%s][launcher-sig] replayed signature remote=%s path=%s uin=%d\n", logNow(), r.RemoteAddr, r.URL.Path, uin)
 		http.Error(w, "replayed signature", http.StatusUnauthorized)
 		return
 	}
@@ -241,7 +255,7 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	// The signed message is uin(8B) || timestamp(8B).
 	message := payload[0:16]
 	if !ed25519.Verify(m.pubKey, message, signature[:]) {
-		fmt.Printf("[launcher-sig] Ed25519 verification failed remote=%s path=%s uin=%d\n", r.RemoteAddr, r.URL.Path, uin)
+		fmt.Printf("[%s][launcher-sig] Ed25519 verification failed remote=%s path=%s uin=%d\n", logNow(), r.RemoteAddr, r.URL.Path, uin)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
@@ -249,29 +263,40 @@ func (m *AuthMiddleware) handleLauncherSignature(
 	// --- 6. Body UIN check ---
 	bodyUIN, bodyCmd, err := extractUIN(bodyBytes)
 	if err != nil {
-		fmt.Printf("[launcher-sig] failed to extract UIN from body remote=%s path=%s err=%v\n", r.RemoteAddr, r.URL.Path, err)
+		fmt.Printf("[%s][launcher-sig] failed to extract UIN from body remote=%s path=%s err=%v\n", logNow(), r.RemoteAddr, r.URL.Path, err)
 		http.Error(w, "invalid request body", http.StatusUnauthorized)
 		return
 	}
 
-	if uin != bodyUIN && bodyCmd != "wtlogin.trans_emp" && bodyUIN != 0 {
-		fmt.Printf("[launcher-sig] UIN mismatch remote=%s path=%s sig_uin=%d body_uin=%d cmd=%s\n", r.RemoteAddr, r.URL.Path, uin, bodyUIN, bodyCmd)
+	if bodyCmd != "wtlogin.trans_emp" && uin != bodyUIN {
+		fmt.Printf("[%s][launcher-sig] UIN mismatch remote=%s path=%s sig_uin=%d body_uin=%d cmd=%s\n", logNow(), r.RemoteAddr, r.URL.Path, uin, bodyUIN, bodyCmd)
 		http.Error(w, "uin mismatch", http.StatusUnauthorized)
 		return
 	}
 
-	// --- 7. Mark signature as used (anti-replay) and issue token ---
-	m.cache.add(cacheKey, TimestampTolerance)
+	// --- 7. Atomic check-and-add: closes the TOCTOU window ---
+	// Two goroutines that both passed the fast-path has() check above could
+	// both reach this point with the same signature.  checkAndAdd holds the
+	// cache mutex for the entire check+insert, so exactly one of them will
+	// win; the other sees alreadyPresent==true and is rejected as a replay.
+	// Placing this after Ed25519 and UIN checks ensures only fully-verified
+	// signatures ever enter the cache; invalid or mismatched requests do not
+	// consume cache space and do not block legitimate retries.
+	if m.cache.checkAndAdd(cacheKey, TimestampTolerance) {
+		fmt.Printf("[%s][launcher-sig] replayed signature (concurrent) remote=%s path=%s uin=%d\n", logNow(), r.RemoteAddr, r.URL.Path, uin)
+		http.Error(w, "replayed signature", http.StatusUnauthorized)
+		return
+	}
 
 	tokenStr, err := m.generateToken(uin)
 	if err != nil {
-		fmt.Printf("[launcher-sig] failed to generate token uin=%d err=%v\n", uin, err)
+		fmt.Printf("[%s][launcher-sig] failed to generate token uin=%d err=%v\n", logNow(), uin, err)
 		http.Error(w, "failed to generate token", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("X-Set-Token", tokenStr)
 
-	fmt.Printf("[launcher-sig] auth OK, token issued uin=%d remote=%s path=%s\n", uin, r.RemoteAddr, r.URL.Path)
+	fmt.Printf("[%s][launcher-sig] auth OK, token issued uin=%d remote=%s path=%s\n", logNow(), uin, r.RemoteAddr, r.URL.Path)
 	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	next.ServeHTTP(w, r)
 }
@@ -301,7 +326,7 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if !strings.HasPrefix(auth, prefix) {
-			fmt.Printf("[refresh] malformed authorization header remote=%s\n", r.RemoteAddr)
+			fmt.Printf("[%s][refresh] malformed authorization header remote=%s\n", logNow(), r.RemoteAddr)
 			http.Error(w, "invalid authorization header", http.StatusUnauthorized)
 			return
 		}
@@ -315,7 +340,7 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 			return m.jwtSecret, nil
 		})
 		if err != nil || !token.Valid {
-			fmt.Printf("[refresh] invalid token remote=%s err=%v\n", r.RemoteAddr, err)
+			fmt.Printf("[%s][refresh] invalid token remote=%s err=%v\n", logNow(), r.RemoteAddr, err)
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
@@ -324,12 +349,12 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < TokenRenewThreshold {
 			if newToken, err := m.generateToken(claims.UIN); err == nil {
 				w.Header().Set("X-Set-Token", newToken)
-				fmt.Printf("[refresh] token renewed uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
+				fmt.Printf("[%s][refresh] token renewed uin=%d remaining=%s\n", logNow(), claims.UIN, time.Until(claims.ExpiresAt.Time))
 			} else {
-				fmt.Printf("[refresh] failed to generate token uin=%d err=%v\n", claims.UIN, err)
+				fmt.Printf("[%s][refresh] failed to generate token uin=%d err=%v\n", logNow(), claims.UIN, err)
 			}
 		} else {
-			fmt.Printf("[refresh] token still fresh, no renewal uin=%d remaining=%s\n", claims.UIN, time.Until(claims.ExpiresAt.Time))
+			fmt.Printf("[%s][refresh] token still fresh, no renewal uin=%d remaining=%s\n", logNow(), claims.UIN, time.Until(claims.ExpiresAt.Time))
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -341,6 +366,11 @@ func (m *AuthMiddleware) RefreshHandler() http.Handler {
 // leaks.  After Stop returns the middleware must not be used.
 func (m *AuthMiddleware) Stop() {
 	m.cache.stop()
+}
+
+// logNow returns the current local time as a formatted string for log lines.
+func logNow() string {
+	return time.Now().Format("2006-01-02 15:04:05.000")
 }
 
 // The field is expected to be a non-negative integer.

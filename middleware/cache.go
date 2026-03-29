@@ -51,6 +51,26 @@ func (c *sigCache) add(sig string, ttl time.Duration) {
 	c.entries[sig] = sigEntry{expiresAt: time.Now().Add(ttl)}
 }
 
+// checkAndAdd atomically checks whether sig is already present and valid in the
+// cache.  If it is, it returns true (replay detected) and leaves the cache
+// unchanged.  If it is not, it inserts sig with the given ttl and returns
+// false.
+//
+// This must be called instead of a separate has()+add() pair whenever the
+// caller needs to guarantee that at most one concurrent goroutine can succeed
+// with the same signature (i.e. after Ed25519 verification passes), because
+// the separate calls leave a TOCTOU window where two goroutines could both
+// observe has()==false before either one completes add().
+func (c *sigCache) checkAndAdd(sig string, ttl time.Duration) (alreadyPresent bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[sig]; ok && !time.Now().After(e.expiresAt) {
+		return true // still valid → replay
+	}
+	c.entries[sig] = sigEntry{expiresAt: time.Now().Add(ttl)}
+	return false
+}
+
 // stop shuts down the background GC goroutine.  It is safe to call more than
 // once.  After Stop returns the cache can no longer be used.
 func (c *sigCache) stop() {
